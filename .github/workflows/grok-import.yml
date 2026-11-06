@@ -1,0 +1,161 @@
+name: Import Grok workspace archive
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+    paths:
+      - ".github/workflows/grok-import.yml"
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: grok-workspace-import-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  extract-and-document:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the import branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Extract archive safely
+        id: extract
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, stat, zipfile
+          from pathlib import Path, PurePosixPath
+
+          archive = Path("grok-workspace-1-1.zip")
+          if not archive.is_file():
+              raise SystemExit("Required archive grok-workspace-1-1.zip is missing")
+          destination = Path("grok-workspace")
+          destination.mkdir(exist_ok=True)
+          files, dirs, images = [], 0, []
+          with zipfile.ZipFile(archive) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise SystemExit(f"ZIP CRC failure: {bad}")
+              for info in zf.infolist():
+                  rel = PurePosixPath(info.filename)
+                  if rel.is_absolute() or ".." in rel.parts:
+                      raise SystemExit(f"Unsafe archive path: {info.filename}")
+                  if not rel.parts:
+                      continue
+                  if info.is_dir():
+                      dirs += 1
+                      continue
+                  target = destination.joinpath(*rel.parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  data = zf.read(info)
+                  target.write_bytes(data)
+                  mode = (info.external_attr >> 16) & 0o777
+                  executable = bool(mode & 0o111)
+                  target.chmod(0o755 if executable else 0o644)
+                  files.append(rel.as_posix())
+                  if target.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+                      images.append(rel.as_posix())
+          Path("grok-workspace-import-manifest.json").write_text(
+              json.dumps({"archive": archive.name, "files": sorted(files),
+                          "directories": dirs, "images": sorted(images)}, indent=2) + "\n",
+              encoding="utf-8")
+          print(f"Extracted {len(files)} files and {dirs} directory entries; {len(images)} images.")
+          PY
+
+      - name: Create the exact import commit
+        id: import
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add grok-workspace grok-workspace-import-manifest.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Import Grok workspace"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Generate mission README with every archived image
+        env:
+          IMPORT_SHA: ${{ steps.import.outputs.sha }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          manifest = json.loads(Path("grok-workspace-import-manifest.json").read_text(encoding="utf-8"))
+          files = manifest["files"]
+          images = manifest["images"]
+          groups = {}
+          for name in files:
+              first = name.split("/", 1)[0] if "/" in name else "(workspace root)"
+              groups.setdefault(first, []).append(name)
+          lines = [
+            "# Grok Workspace — Mission Overview", "",
+            "> Engineering field guide to the imported Grok application workspace. "
+            "This document inventories the archived source and its visible interface assets; "
+            "it does not claim a fresh build or runtime validation.", "",
+            "## Mission summary", "",
+            "The workspace is a self-contained application project imported from the supplied ZIP archive. "
+            "Its source tree, configuration, migrations, scripts, public assets, and interface captures "
+            "are preserved beneath `grok-workspace/`. The repository retains its pre-existing files "
+            "and the original ZIP for provenance.", "",
+            "## Systems inventory", "",
+            "| Subsystem / directory | Contents |", "|---|---|"
+          ]
+          for group in sorted(groups):
+              sample = ", ".join(f"`{x}`" for x in groups[group][:5])
+              if len(groups[group]) > 5:
+                  sample += f", and {len(groups[group]) - 5} more"
+              lines.append(f"| `grok-workspace/{group}/` | {len(groups[group])} files; {sample} |")
+          lines += ["", f"**Archive inventory:** {len(files)} files, {manifest['directories']} directory entries, and {len(images)} image assets.", "",
+                    "## Screenshots and visual assets", ""]
+          if images:
+              for image in images:
+                  stem = Path(image).stem.replace("-", " ").replace("_", " ")
+                  caption = " ".join(w.capitalize() for w in stem.split())
+                  lines += [f"![{caption}](grok-workspace/{image})", "", f"*Figure: {caption} — archived visual asset at `grok-workspace/{image}`.*", ""]
+          else:
+              lines += ["No supported image files were present in the archive.", ""]
+          lines += ["## Launch checklist", "",
+                    "1. Install a currently supported Node.js LTS release if this is a JavaScript/TypeScript application.",
+                    "2. Review `grok-workspace/package.json`, `AGENTS.md`, and project-specific configuration before running commands.",
+                    "3. Install dependencies using the lockfile-appropriate command (typically `npm ci`) in a controlled environment.",
+                    "4. Inspect environment-variable requirements and migrations before starting any services.",
+                    "5. Use the documented development, type-check, lint, and test scripts where present; record actual results separately.",
+                    "6. Treat archived build output as historical evidence, not proof of a fresh reproducible build.", "",
+                    "## Mission log", "",
+                    f"- Import date (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+                    f"- Import commit: `{os.environ['IMPORT_SHA']}`",
+                    f"- Source archive: `grok-workspace-1-1.zip`",
+                    f"- Archive integrity: passed during extraction; extracted files are listed in `grok-workspace-import-manifest.json`.",
+                    "- History policy: branch-first; no force-push; existing main history is retained.", ""]
+          Path("README.grok.md").write_text("\n".join(lines), encoding="utf-8")
+          PY
+
+      - name: Commit README
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.grok.md
+          if ! git diff --cached --quiet; then
+            git commit -m "Document Grok workspace mission overview"
+            git push origin HEAD:${{ github.event.pull_request.head.ref }}
+          fi
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Working tree clean."
+          else
+            git status --short
+            exit 1
+          fi
